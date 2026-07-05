@@ -1775,7 +1775,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
-                    get_attention_backends=lambda: (None, "intel_xpu"),
+                    decode_attention_backend="intel_xpu",
                     use_mla_backend=lambda: False,
                 )
             ),
@@ -1784,7 +1784,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
-                    get_attention_backends=lambda: (None, "intel_xpu"),
+                    decode_attention_backend="intel_xpu",
                     use_mla_backend=lambda: True,
                     page_size=16,  # MLA decode accepts 16
                 )
