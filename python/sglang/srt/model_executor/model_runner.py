@@ -1529,7 +1529,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        if self.server_args.kv_cache_dtype == "fp8_e4m3":
+        if get_flags().kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
                     self.model.load_kv_cache_scales(
@@ -2444,7 +2444,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.kv_cache_dtype = resolved
 
     def configure_kv_cache_dtype(self):
-        if self.server_args.kv_cache_dtype == "auto":
+        if get_flags().kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
             if (
@@ -2457,19 +2457,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             else:
                 self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+        elif get_flags().kv_cache_dtype == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
-        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+        elif get_flags().kv_cache_dtype == "fp8_e4m3":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
-        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+        elif get_flags().kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
-        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+        elif get_flags().kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
@@ -2480,7 +2480,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+                f"Unsupported kv_cache_dtype: {get_flags().kv_cache_dtype}."
             )
 
     def init_cublas(self):
