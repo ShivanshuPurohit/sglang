@@ -491,8 +491,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             config_extra=config_extra,
             enable_hierarchical_cache=True,
         )
-        # dual-apply == legacy writes
-        self.assertEqual(sa.swa_full_tokens_ratio, 1.0)
+        # dual-apply retired: the field stays pristine
+        self.assertEqual(sa.swa_full_tokens_ratio, 0.8)
         self.assertTrue(sa.disable_hybrid_swa_memory)
         flags = self._publish(sa)
         self.assertEqual(flags.swa_full_tokens_ratio, 1.0)

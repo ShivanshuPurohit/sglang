@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -274,13 +274,13 @@ def initialize_moe_config(server_args: ServerArgs):
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
     SPECULATIVE_MOE_RUNNER_BACKEND = (
-        MoeRunnerBackend(server_args.speculative_moe_runner_backend)
-        if server_args.speculative_moe_runner_backend is not None
+        MoeRunnerBackend(get_flags().speculative_moe_runner_backend)
+        if get_flags().speculative_moe_runner_backend is not None
         else MOE_RUNNER_BACKEND
     )
     SPECULATIVE_MOE_A2A_BACKEND = (
-        MoeA2ABackend(server_args.speculative_moe_a2a_backend)
-        if server_args.speculative_moe_a2a_backend is not None
+        MoeA2ABackend(get_flags().speculative_moe_a2a_backend)
+        if get_flags().speculative_moe_a2a_backend is not None
         else MOE_A2A_BACKEND
     )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
