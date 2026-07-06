@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
+    minimax_sparse_verify,
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -142,20 +143,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self._use_msa_decode = self.use_msa and not _decode_cuda_graph
 
-        # MSA + speculative decode + cuda graph is unsupported: spec verify
-        # (TARGET_VERIFY) batches route to forward_extend and are captured into the
-        # decode graph, which both dereferences extend metadata absent in the capture
-        # batch and would record the MSA prefill kernel into a graph. Fail loudly at
-        # startup instead of crashing mid-capture.
-        if (
-            self.use_msa
-            and _decode_cuda_graph
-            and getattr(_sa, "speculative_algorithm", None) is not None
+        # Spec-decode verify (TARGET_VERIFY) routes through _forward_verify, whose
+        # qlen attend assumes a LINEAR draft chain: token j of a request attends to
+        # positions [0, prefix + j]. Draft trees — eagle-topk > 1, or algorithms
+        # that verify a custom_mask token tree (e.g. NGRAM) — are not implemented.
+        # Fail loudly at startup instead of silently mis-attending mid-verify.
+        _spec_algo = getattr(_sa, "speculative_algorithm", None)
+        if _spec_algo is not None and (
+            _spec_algo not in ("EAGLE", "EAGLE3")
+            or (getattr(_sa, "speculative_eagle_topk", None) or 1) > 1
         ):
             raise NotImplementedError(
-                "MiniMax-M3 MSA attention does not support speculative decoding under "
-                "CUDA graph. Use --disable-cuda-graph, set SGLANG_DISABLE_MSA=1, or "
-                "disable speculative decoding."
+                "MiniMax-M3 sparse attention supports speculative decoding only "
+                "with a linear EAGLE/EAGLE3 draft chain "
+                "(--speculative-eagle-topk 1); tree and custom-mask speculation "
+                "is not implemented."
             )
         # MSA owns the main decode step unless dense-sparse-decode does; the dense
         # path only engages when k_cache.shape[1] == 1 (see forward_decode).
@@ -316,6 +318,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
+        # Spec-decode verify (TARGET_VERIFY): route through the decode-path qlen
+        # attend instead of the prefill attend. Verify batches classify as
+        # is_extend() so they land here, but the prefill main-attend does not
+        # produce a correct verify result; the decode split-K kernel carrying
+        # decode_query_len does (vLLM's spec-as-decode design). Chain drafts only
+        # (eagle-topk=1), enforced at startup in __init__.
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_verify(
+                q,
+                layer,
+                forward_batch,
+                idx_q=idx_q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                idx_k_cache=idx_k_cache,
+                idx_v_cache=idx_v_cache,
+                disable_value=disable_value,
+            )
+
         cu_seqlens = torch.cat(
             [
                 torch.zeros(
@@ -393,6 +414,97 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else idx_o.reshape(original_num_tokens, -1).contiguous()
             ),
             o.reshape(original_num_tokens, -1).contiguous(),
+        )
+
+    def _forward_verify(
+        self,
+        q: torch.Tensor,  # [total_q, num_q_heads, qk_head_dim] (total_q = num_reqs*dq)
+        layer,
+        forward_batch: ForwardBatch,
+        *,
+        idx_q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        disable_value: bool,
+    ):
+        """Spec-decode verify via the decode-path qlen attend (KV already written
+        by the caller). decode_query_len = draft_token_num (uniform per request);
+        seq_lens = prefix + dq. Linear-causal chain (eagle-topk=1) only."""
+        spec_info = forward_batch.spec_info
+        assert spec_info is not None and spec_info.draft_token_num > 0
+        dq = spec_info.draft_token_num
+        num_reqs = forward_batch.seq_lens.shape[0]
+        total_q = q.shape[0]
+        device = forward_batch.seq_lens.device
+        # At TARGET_VERIFY, forward_batch.seq_lens is the committed PREFIX length:
+        # EagleVerifyInput.verify() increments it only AFTER this forward, so the
+        # dq draft tokens occupy absolute positions [prefix, prefix + dq). The
+        # attend/indexer kernels compute query_pos = seq_lens - dq + q_offset and
+        # therefore need seq_lens == prefix + dq to land query token j at prefix + j.
+        prefix_lens = forward_batch.seq_lens.to(torch.int32)
+        seq_lens = prefix_lens + dq  # total KV length
+        # Q-side cumulative for the indexer: [0, dq, 2*dq, ..., num_reqs*dq].
+        cu_seqlens = torch.arange(
+            0, (num_reqs + 1) * dq, dq, dtype=torch.int32, device=device
+        )
+        # Graph-safe max_seqlen_k. A ``.item()`` host sync here would freeze at its
+        # CUDA-graph capture value (the small fill seq_len) and under-cover the
+        # index-score grid on replay with longer sequences -> wrong top-k for
+        # multi-block requests -> silent accuracy loss. The static context length is
+        # a graph constant, and the kernels mask to the runtime per-token seq_lens
+        # internally, so over-covering is correctness-safe.
+        max_seqlen_k = self.max_context_len
+
+        # Ensure req_to_token holds the dq draft KV slots at columns
+        # [prefix, prefix + dq) (out_cache_loc is request-major, token-minor).
+        # The sparse attend and indexer resolve KV exclusively through
+        # req_to_token, so this invariant must hold before the kernels run;
+        # writing it here is idempotent when verify-prep has already
+        # established it.
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc is not None and total_q == num_reqs * dq:
+            rows = forward_batch.req_pool_indices.repeat_interleave(dq).to(torch.long)
+            cols = (
+                (
+                    prefix_lens.reshape(num_reqs, 1)
+                    + torch.arange(dq, device=device, dtype=torch.int32).reshape(1, dq)
+                )
+                .reshape(-1)
+                .to(torch.long)
+            )
+            self.req_to_token[rows, cols] = out_cache_loc[:total_q].to(
+                self.req_to_token.dtype
+            )
+
+        idx_o, o = minimax_sparse_verify(
+            q,
+            k_cache,
+            v_cache,
+            idx_q,
+            idx_k_cache,
+            idx_v_cache,
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            dq,
+            dq,  # max_seqlen_q = dq (uniform)
+            max_seqlen_k,
+            self.block_size_q,
+            self.block_size_k,
+            self.topk_blocks,
+            self.init_blocks,
+            self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=disable_value,
+            seqlens_cpu=[dq] * num_reqs,
+        )
+        return (
+            None if idx_o is None else idx_o.reshape(total_q, -1).contiguous(),
+            o.reshape(total_q, -1).contiguous(),
         )
 
     def _dense_sparse_main_decode(

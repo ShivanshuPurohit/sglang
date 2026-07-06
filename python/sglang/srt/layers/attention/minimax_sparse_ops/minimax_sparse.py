@@ -8,6 +8,7 @@ from .common.index import topk_index_reduce
 from .common.utils import get_cu_seqblocks
 from .decode.flash_with_topk_idx import flash_decode_with_topk_idx
 from .decode.topk_sparse import flash_decode_with_gqa_share_sparse
+from .decode.topk_sparse_qlen import flash_decode_with_gqa_share_sparse_qlen
 from .prefill.flash_with_topk_idx import flash_prefill_with_topk_index
 from .prefill.topk_sparse import flash_prefill_with_gqa_share_sparse
 
@@ -231,4 +232,94 @@ def minimax_sparse_decode(
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
             )
+    return idx_o, o
+
+
+def minimax_sparse_verify(
+    q: torch.Tensor,  # [total_q, num_q_heads, qk_head_dim]  (total_q = num_reqs*dq)
+    k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged main)
+    v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged main)
+    idx_q: torch.Tensor,  # [total_q, num_idx_heads, idx_head_dim]
+    idx_k_cache: torch.Tensor,  # [max_slots, 1, idx_head_dim] (paged index)
+    idx_v_cache: Optional[torch.Tensor],  # None when disable_index_value
+    req_to_token: torch.Tensor,  # [max_reqs, max_kv_len]
+    slot_ids: torch.Tensor,  # [num_reqs, ]
+    cu_seqlens: torch.Tensor,  # [num_reqs + 1, ] (Q-side cumulative; = arange(0, (nr+1)*dq, dq))
+    seq_lens: torch.Tensor,  # [num_reqs, ] total K length (prefix + dq)
+    prefix_lens: torch.Tensor,  # [num_reqs, ] (= seq_lens - dq)
+    decode_query_len: int,  # dq = draft_token_num (uniform per request)
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    block_size_q: int,
+    block_size_k: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+    sm_scale: Optional[float] = None,
+    idx_sm_scale: Optional[float] = None,
+    score_type: str = "max",
+    disable_index_value: bool = False,
+    seqlens_cpu: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MiniMax-M3 sparse attention for a spec-decode VERIFY batch (decode-path).
+
+    Verify presents ``decode_query_len`` query tokens per request, flattened
+    request-major. Block selection reuses the PREFILL lightning indexer (already
+    per-query-token causal via cu_seqlens/prefix_lens); the main attend uses the
+    decode-path qlen kernel (split-K flash-decoding, linear per-token causal).
+    Correct only for a LINEAR draft chain (eagle-topk=1). This is the sglang
+    analog of vLLM's MiniMaxM3SparseTritonImpl decode branch (index_topk +
+    minimax_m3_sparse_attn_decode with decode_query_len).
+    """
+    # Step 1: lightning indexer -> per-token top-k blocks (prefill kernel is the
+    # qlen>1-capable one; the decode indexer assumes 1 query token per request).
+    cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
+        cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
+    )
+    idx_o, topk_idx = flash_prefill_with_topk_index(
+        q=idx_q,
+        k_cache=idx_k_cache,
+        v_cache=idx_v_cache,
+        sink=None,
+        req_to_token=req_to_token,
+        slot_ids=slot_ids,
+        cu_seqlens=cu_seqlens,
+        seq_lens=seq_lens,
+        prefix_lens=prefix_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        block_size_q=block_size_q,
+        block_size_k=block_size_k,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        sm_scale=idx_sm_scale,
+        score_type=score_type,
+        disable_index_value=disable_index_value,
+        cu_seqblocks_q=cu_seqblocks_q,
+        max_seqblock_q=max_seqblock_q,
+        all_seqblock_q=all_seqblock_q,
+    )
+    # Step 2: reduce top-k idx if num_idx_heads > num_kv_heads
+    num_idx_heads = idx_q.shape[1]
+    num_kv_heads = k_cache.shape[1]
+    idx_group_size = num_idx_heads // num_kv_heads
+    if idx_group_size > 1:
+        topk_idx = topk_index_reduce(
+            topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+        )
+    # Step 3: block-sparse GQA attend over the selected blocks, decode-path with
+    # decode_query_len (Triton, cuda-graph-safe shape-constant grid).
+    o = flash_decode_with_gqa_share_sparse_qlen(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        req_to_token=req_to_token,
+        seq_lens=seq_lens,
+        slot_ids=slot_ids,
+        block_size=block_size_k,
+        topk_idx=topk_idx,
+        decode_query_len=decode_query_len,
+        sm_scale=sm_scale,
+    )
     return idx_o, o
